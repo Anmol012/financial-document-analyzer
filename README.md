@@ -1,5 +1,3 @@
----
-
 ## Setup Instructions
 
 ### Environment Setup
