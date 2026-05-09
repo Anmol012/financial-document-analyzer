@@ -1,4 +1,4 @@
 export const config = {
-  baseUrl: 'http://localhost:5000/api',  // Backend base URL
-  testdata: true,  // Set to false for real backend
+  baseUrl: import.meta.env.VITE_BASE_URL || 'http://localhost:5000/api',
+  testdata: import.meta.env.VITE_TEST_DATA === 'true' || false,
 };

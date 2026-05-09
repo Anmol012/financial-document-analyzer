@@ -3,7 +3,7 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import History from './pages/History';
 import Header from './components/Header';
-import { Toaster } from '@radix-ui/react-toast'; // Fix import
+import { Toaster } from '@/components/ui/toaster';
 import { useState, useEffect } from 'react';
 
 function App() {

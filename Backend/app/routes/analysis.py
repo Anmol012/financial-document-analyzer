@@ -1,182 +1,139 @@
-from flask import Blueprint, request, jsonify, send_file
-from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
-from app.extensions import mongo
-from app.utils.export_utils import generate_pdf_report, generate_csv_report
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
+from fastapi.responses import FileResponse
 from bson import ObjectId
-import logging
+from datetime import datetime
 import os
 import tempfile
+import logging
 
-bp = Blueprint('analysis', __name__)
+from app.extensions import mongo
+from app.utils.export_utils import generate_pdf_report, generate_csv_report
+from app.dependencies import get_current_user
+
+router = APIRouter()
 logger = logging.getLogger(__name__)
 
-@bp.route('/history', methods=['GET'])
-@jwt_required()
-def get_analysis_history():
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Get query parameters
-        document_id = request.args.get('documentId')
-        page = int(request.args.get('page', 1))
-        limit = int(request.args.get('limit', 10))
-        skip = (page - 1) * limit
-        
-        # Build query
-        query = {}
-        if user_role != 'Admin':
-            query['user_id'] = ObjectId(user_id)
-        
-        if document_id:
-            query['document_id'] = ObjectId(document_id)
-        
-        # Get analyses
-        analyses_cursor = mongo.db.analyses.find(query).sort('completed_at', -1).skip(skip).limit(limit)
-        total = mongo.db.analyses.count_documents(query)
-        
-        history = []
-        for analysis in analyses_cursor:
-            # Get document name
-            document = mongo.db.documents.find_one({'_id': analysis['document_id']})
-            document_name = document['name'] if document else 'Unknown'
-            
-            history.append({
-                'id': str(analysis['_id']),
-                'documentName': document_name,
-                'completedAt': analysis['completed_at'].isoformat() + 'Z' if analysis.get('completed_at') else None,
-                'status': analysis['status']
-            })
-        
-        return jsonify({
-            'history': history,
-            'total': total
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Get analysis history error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
 
-@bp.route('/<analysis_id>', methods=['GET'])
-@jwt_required()
-def get_analysis(analysis_id):
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Find analysis
-        analysis = mongo.db.analyses.find_one({'_id': ObjectId(analysis_id)})
-        
-        if not analysis:
-            return jsonify({'error': 'Analysis not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(analysis['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        return jsonify({
-            'analysis': {
-                'id': str(analysis['_id']),
-                'documentId': str(analysis['document_id']),
-                'results': analysis['results'],
-                'confidence': analysis['confidence'],
-                'completedAt': analysis['completed_at'].isoformat() + 'Z' if analysis.get('completed_at') else None,
-                'status': analysis['status']
-            }
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Get analysis error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+@router.get("/history")
+def get_analysis_history(
+    documentId: str = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+    skip = (page - 1) * limit
 
-@bp.route('/<analysis_id>/export', methods=['GET'])
-@jwt_required()
-def export_analysis(analysis_id):
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Get format parameter
-        export_format = request.args.get('format', 'pdf').lower()
-        
-        if export_format not in ['pdf', 'csv']:
-            return jsonify({'error': 'Invalid format. Use pdf or csv'}), 400
-        
-        # Find analysis
-        analysis = mongo.db.analyses.find_one({'_id': ObjectId(analysis_id)})
-        
-        if not analysis:
-            return jsonify({'error': 'Analysis not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(analysis['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        # Get document info
-        document = mongo.db.documents.find_one({'_id': analysis['document_id']})
-        document_name = document['name'] if document else 'Unknown'
-        
-        # Generate export file
-        temp_dir = tempfile.gettempdir()
-        
-        if export_format == 'pdf':
-            filename = f"analysis_{analysis_id}.pdf"
-            filepath = os.path.join(temp_dir, filename)
-            generate_pdf_report(analysis, document_name, filepath)
-            mimetype = 'application/pdf'
-        else:  # csv
-            filename = f"analysis_{analysis_id}.csv"
-            filepath = os.path.join(temp_dir, filename)
-            generate_csv_report(analysis, document_name, filepath)
-            mimetype = 'text/csv'
-        
-        logger.info(f"Analysis exported: {analysis_id} as {export_format}")
-        
-        return send_file(
-            filepath,
-            mimetype=mimetype,
-            as_attachment=True,
-            download_name=filename
-        )
-        
-    except Exception as e:
-        logger.error(f"Export analysis error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+    query = {}
+    if user_role != 'Admin':
+        query['user_id'] = ObjectId(user_id)
+    if documentId:
+        query['document_id'] = ObjectId(documentId)
 
-@bp.route('/<analysis_id>', methods=['DELETE'])
-@jwt_required()
-def delete_analysis(analysis_id):
+    cursor = mongo.db.analyses.find(query).sort('completed_at', -1).skip(skip).limit(limit)
+    total = mongo.db.analyses.count_documents(query)
+
+    history = []
+    for a in cursor:
+        doc = mongo.db.documents.find_one({'_id': a['document_id']})
+        history.append({
+            'id': str(a['_id']),
+            'documentName': doc['name'] if doc else 'Unknown',
+            'completedAt': a['completed_at'].isoformat() + 'Z' if a.get('completed_at') else None,
+            'status': a['status'],
+        })
+
+    return {'history': history, 'total': total}
+
+
+@router.get("/{analysis_id}")
+def get_analysis(analysis_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    analysis = mongo.db.analyses.find_one({'_id': ObjectId(analysis_id)})
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if user_role != 'Admin' and str(analysis['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    return {
+        'analysis': {
+            'id': str(analysis['_id']),
+            'documentId': str(analysis['document_id']),
+            'results': analysis['results'],
+            'confidence': analysis['confidence'],
+            'completedAt': analysis['completed_at'].isoformat() + 'Z' if analysis.get('completed_at') else None,
+            'status': analysis['status'],
+        }
+    }
+
+
+@router.get("/{analysis_id}/export")
+def export_analysis(
+    analysis_id: str,
+    format: str = Query("pdf"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    if format not in ('pdf', 'csv'):
+        raise HTTPException(status_code=400, detail="Invalid format. Use 'pdf' or 'csv'")
+
+    analysis = mongo.db.analyses.find_one({'_id': ObjectId(analysis_id)})
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if user_role != 'Admin' and str(analysis['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    doc = mongo.db.documents.find_one({'_id': analysis['document_id']})
+    document_name = doc['name'] if doc else 'Unknown'
+
+    temp_dir = tempfile.gettempdir()
+    filename = f"analysis_{analysis_id}.{format}"
+    filepath = os.path.join(temp_dir, filename)
+
+    if format == 'pdf':
+        generate_pdf_report(analysis, document_name, filepath)
+        media_type = 'application/pdf'
+    else:
+        generate_csv_report(analysis, document_name, filepath)
+        media_type = 'text/csv'
+
+    # Clean up temp file after response is sent
+    background_tasks.add_task(_remove_file, filepath)
+
+    logger.info(f"Analysis exported: {analysis_id} as {format}")
+    return FileResponse(filepath, media_type=media_type, filename=filename, background=background_tasks)
+
+
+@router.delete("/{analysis_id}")
+def delete_analysis(analysis_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    analysis = mongo.db.analyses.find_one({'_id': ObjectId(analysis_id)})
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if user_role != 'Admin' and str(analysis['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    mongo.db.documents.update_one(
+        {'analysis_id': ObjectId(analysis_id)},
+        {'$set': {'analysis_id': None, 'status': 'pending'}}
+    )
+    mongo.db.analyses.delete_one({'_id': ObjectId(analysis_id)})
+
+    logger.info(f"Analysis deleted: {analysis_id}")
+    return {'message': 'Analysis deleted'}
+
+
+def _remove_file(path: str):
     try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Find analysis
-        analysis = mongo.db.analyses.find_one({'_id': ObjectId(analysis_id)})
-        
-        if not analysis:
-            return jsonify({'error': 'Analysis not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(analysis['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        # Update document to remove analysis reference
-        mongo.db.documents.update_one(
-            {'analysis_id': ObjectId(analysis_id)},
-            {'$set': {'analysis_id': None, 'status': 'pending'}}
-        )
-        
-        # Delete analysis
-        mongo.db.analyses.delete_one({'_id': ObjectId(analysis_id)})
-        
-        logger.info(f"Analysis deleted: {analysis_id}")
-        
-        return jsonify({'message': 'Analysis deleted'}), 200
-        
-    except Exception as e:
-        logger.error(f"Delete analysis error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass

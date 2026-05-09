@@ -1,304 +1,240 @@
-from flask import Blueprint, request, jsonify, send_file
-from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
-from werkzeug.utils import secure_filename
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form, Query
+from fastapi.responses import FileResponse
+from bson import ObjectId
+from datetime import datetime
+import os
+import re
+import logging
+
 from app.extensions import mongo
 from app.models import Document
 from app.tasks.analysis_tasks import analyze_document_task
-from bson import ObjectId
-import os
-import logging
-from datetime import datetime
+from app.dependencies import get_current_user
 
-bp = Blueprint('documents', __name__)
+router = APIRouter()
 logger = logging.getLogger(__name__)
 
 UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'pdf'}
-MAX_FILE_SIZE = 104857600  # 100MB
+MAX_FILE_SIZE = 104857600  # 100 MB
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@bp.route('/upload', methods=['POST'])
-@jwt_required()
-def upload_document():
-    try:
-        user_id = get_jwt_identity()
-        
-        # Check if file is in request
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-        
-        file = request.files['file']
-        
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'}), 400
-        
-        if not allowed_file(file.filename):
-            return jsonify({'error': 'Invalid file format. Only PDF files are allowed'}), 400
-        
-        # Check file size
-        file.seek(0, os.SEEK_END)
-        file_size = file.tell()
-        file.seek(0)
-        
-        if file_size > MAX_FILE_SIZE:
-            return jsonify({'error': 'File size exceeds maximum limit of 100MB'}), 400
-        
-        # Save file
-        filename = secure_filename(file.filename)
-        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        unique_filename = f"{timestamp}_{filename}"
-        file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
-        file.save(file_path)
-        
-        # Get document name from request or use filename
-        document_name = request.form.get('name', filename)
-        
-        # Create document record
-        document_data = Document.create(document_name, user_id, file_path, file_size)
-        result = mongo.db.documents.insert_one(document_data)
-        
-        logger.info(f"Document uploaded: {unique_filename} by user {user_id}")
-        
-        return jsonify({
-            'message': 'Document uploaded',
-            'document': {
-                'id': str(result.inserted_id),
-                'name': document_name,
-                'uploadDate': document_data['upload_date'].isoformat() + 'Z',
-                'status': document_data['status']
-            }
-        }), 201
-        
-    except Exception as e:
-        logger.error(f"Upload error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+def _secure_filename(filename: str) -> str:
+    filename = os.path.basename(filename)
+    filename = re.sub(r'[^\w\s.\-]', '', filename).strip()
+    return filename or 'upload.pdf'
 
-@bp.route('', methods=['GET'])
-@jwt_required()
-def get_documents():
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Get query parameters
-        search = request.args.get('search', '')
-        page = int(request.args.get('page', 1))
-        limit = int(request.args.get('limit', 10))
-        skip = (page - 1) * limit
-        
-        # Build query
-        query = {}
-        if user_role != 'Admin':
-            query['user_id'] = ObjectId(user_id)
-        
-        if search:
-            query['name'] = {'$regex': search, '$options': 'i'}
-        
-        # Get documents
-        documents_cursor = mongo.db.documents.find(query).sort('upload_date', -1).skip(skip).limit(limit)
-        total = mongo.db.documents.count_documents(query)
-        
-        documents = []
-        for doc in documents_cursor:
-            documents.append({
-                'id': str(doc['_id']),
-                'name': doc['name'],
-                'uploadDate': doc['upload_date'].isoformat() + 'Z',
-                'status': doc['status'],
-                'analysisId': str(doc['analysis_id']) if doc.get('analysis_id') else None
-            })
-        
-        return jsonify({
-            'documents': documents,
-            'total': total,
-            'page': page
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Get documents error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
 
-@bp.route('/<document_id>', methods=['GET'])
-@jwt_required()
-def get_document(document_id):
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Find document
-        document = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
-        
-        if not document:
-            return jsonify({'error': 'Document not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(document['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        return jsonify({
-            'document': {
-                'id': str(document['_id']),
-                'name': document['name'],
-                'uploadDate': document['upload_date'].isoformat() + 'Z',
-                'status': document['status'],
-                'analysisId': str(document['analysis_id']) if document.get('analysis_id') else None,
-                'fileSize': document['file_size']
-            }
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Get document error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+def _doc_to_dict(doc: dict) -> dict:
+    return {
+        'id': str(doc['_id']),
+        'name': doc['name'],
+        'uploadDate': doc['upload_date'].isoformat() + 'Z',
+        'status': doc['status'],
+        'analysisId': str(doc['analysis_id']) if doc.get('analysis_id') else None,
+    }
 
-@bp.route('/<document_id>/analyze', methods=['POST'])
-@jwt_required()
-def analyze_document(document_id):
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Find document
-        document = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
-        
-        if not document:
-            return jsonify({'error': 'Document not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(document['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        # Get options from request
-        data = request.get_json() or {}
-        options = data.get('options', {})
-        
-        # Trigger analysis task
-        task = analyze_document_task.delay(document_id, user_id, options)
-        
-        logger.info(f"Analysis started for document {document_id}")
-        
-        return jsonify({
-            'message': 'Analysis started',
-            'analysisId': f"analysis_{document_id}"
-        }), 202
-        
-    except Exception as e:
-        logger.error(f"Analyze document error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
 
-@bp.route('/<document_id>/result', methods=['GET'])
-@jwt_required()
-def get_analysis_result(document_id):
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Find document
-        document = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
-        
-        if not document:
-            return jsonify({'error': 'Document not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(document['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        # Find analysis
-        if not document.get('analysis_id'):
-            return jsonify({'error': 'Analysis not found or incomplete'}), 404
-        
-        analysis = mongo.db.analyses.find_one({'_id': document['analysis_id']})
-        
-        if not analysis:
-            return jsonify({'error': 'Analysis not found or incomplete'}), 404
-        
-        return jsonify({
-            'analysis': {
-                'id': str(analysis['_id']),
-                'documentId': str(analysis['document_id']),
-                'results': analysis['results'],
-                'confidence': analysis['confidence'],
-                'completedAt': analysis['completed_at'].isoformat() + 'Z' if analysis.get('completed_at') else None,
-                'status': analysis['status']
-            }
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Get analysis result error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+# ─── Endpoints ───────────────────────────────────────────────────────────────
 
-@bp.route('/<document_id>', methods=['DELETE'])
-@jwt_required()
-def delete_document(document_id):
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Find document
-        document = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
-        
-        if not document:
-            return jsonify({'error': 'Document not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(document['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        # Delete file
-        if os.path.exists(document['file_path']):
-            os.remove(document['file_path'])
-        
-        # Delete analysis if exists
-        if document.get('analysis_id'):
-            mongo.db.analyses.delete_one({'_id': document['analysis_id']})
-        
-        # Delete document
-        mongo.db.documents.delete_one({'_id': ObjectId(document_id)})
-        
-        logger.info(f"Document deleted: {document_id}")
-        
-        return jsonify({'message': 'Document deleted'}), 200
-        
-    except Exception as e:
-        logger.error(f"Delete document error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+@router.post("/upload", status_code=201)
+async def upload_document(
+    file: UploadFile = File(...),
+    name: str = Form(None),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user['sub']
 
-@bp.route('/<document_id>/download', methods=['GET'])
-@jwt_required()
-def download_document(document_id):
-    try:
-        user_id = get_jwt_identity()
-        claims = get_jwt()
-        user_role = claims.get('role', 'Viewer')
-        
-        # Find document
-        document = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
-        
-        if not document:
-            return jsonify({'error': 'Document not found'}), 404
-        
-        # Check permissions
-        if user_role != 'Admin' and str(document['user_id']) != user_id:
-            return jsonify({'error': 'Forbidden'}), 403
-        
-        # Check if file exists
-        if not os.path.exists(document['file_path']):
-            return jsonify({'error': 'File not found'}), 404
-        
-        return send_file(
-            document['file_path'],
-            as_attachment=True,
-            download_name=document['name']
-        )
-        
-    except Exception as e:
-        logger.error(f"Download document error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    contents = await file.read()
+    file_size = len(contents)
+
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File size exceeds 100MB limit")
+
+    filename = _secure_filename(file.filename)
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')
+    unique_filename = f"{timestamp}_{filename}"
+    file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+
+    with open(file_path, 'wb') as f:
+        f.write(contents)
+
+    document_name = name or filename
+    document_data = Document.create(document_name, user_id, file_path, file_size)
+    result = mongo.db.documents.insert_one(document_data)
+
+    logger.info(f"Document uploaded: {unique_filename} by user {user_id}")
+    return {
+        'message': 'Document uploaded',
+        'document': {
+            'id': str(result.inserted_id),
+            'name': document_name,
+            'uploadDate': document_data['upload_date'].isoformat() + 'Z',
+            'status': document_data['status'],
+        },
+    }
+
+
+@router.get("")
+def get_documents(
+    search: str = Query(""),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+    skip = (page - 1) * limit
+
+    query = {}
+    if user_role != 'Admin':
+        query['user_id'] = ObjectId(user_id)
+    if search:
+        query['name'] = {'$regex': search, '$options': 'i'}
+
+    cursor = mongo.db.documents.find(query).sort('upload_date', -1).skip(skip).limit(limit)
+    total = mongo.db.documents.count_documents(query)
+
+    return {
+        'documents': [_doc_to_dict(d) for d in cursor],
+        'total': total,
+        'page': page,
+    }
+
+
+@router.get("/{document_id}")
+def get_document(document_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    doc = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if user_role != 'Admin' and str(doc['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    return {
+        'document': {
+            **_doc_to_dict(doc),
+            'fileSize': doc['file_size'],
+        }
+    }
+
+
+@router.post("/{document_id}/analyze", status_code=202)
+def analyze_document(document_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    doc = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if user_role != 'Admin' and str(doc['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if doc['status'] == 'analyzing':
+        raise HTTPException(status_code=400, detail="Analysis already in progress")
+    if doc['status'] == 'complete':
+        raise HTTPException(status_code=400, detail="Document already analyzed. Delete the analysis to re-run.")
+
+    task = analyze_document_task.delay(document_id, user_id, {})
+    mongo.db.documents.update_one(
+        {'_id': ObjectId(document_id)},
+        {'$set': {'task_id': task.id}}
+    )
+
+    logger.info(f"Analysis started for document {document_id}, task {task.id}")
+    return {'message': 'Analysis started', 'taskId': task.id}
+
+
+@router.get("/{document_id}/status")
+def get_analysis_status(document_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    doc = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if user_role != 'Admin' and str(doc['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    response = {
+        'status': doc['status'],
+        'analysisId': str(doc['analysis_id']) if doc.get('analysis_id') else None,
+    }
+    if doc.get('task_id'):
+        from celery.result import AsyncResult
+        from app.extensions import celery
+        result = AsyncResult(doc['task_id'], app=celery)
+        response['taskState'] = result.state
+
+    return response
+
+
+@router.get("/{document_id}/result")
+def get_analysis_result(document_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    doc = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if user_role != 'Admin' and str(doc['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not doc.get('analysis_id'):
+        raise HTTPException(status_code=404, detail="Analysis not found or incomplete")
+
+    analysis = mongo.db.analyses.find_one({'_id': doc['analysis_id']})
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found or incomplete")
+
+    return {
+        'analysis': {
+            'id': str(analysis['_id']),
+            'documentId': str(analysis['document_id']),
+            'results': analysis['results'],
+            'confidence': analysis['confidence'],
+            'completedAt': analysis['completed_at'].isoformat() + 'Z' if analysis.get('completed_at') else None,
+            'status': analysis['status'],
+        }
+    }
+
+
+@router.delete("/{document_id}")
+def delete_document(document_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    doc = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if user_role != 'Admin' and str(doc['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if os.path.exists(doc['file_path']):
+        os.remove(doc['file_path'])
+    if doc.get('analysis_id'):
+        mongo.db.analyses.delete_one({'_id': doc['analysis_id']})
+    mongo.db.documents.delete_one({'_id': ObjectId(document_id)})
+
+    logger.info(f"Document deleted: {document_id}")
+    return {'message': 'Document deleted'}
+
+
+@router.get("/{document_id}/download")
+def download_document(document_id: str, current_user: dict = Depends(get_current_user)):
+    user_id = current_user['sub']
+    user_role = current_user.get('role', 'Viewer')
+
+    doc = mongo.db.documents.find_one({'_id': ObjectId(document_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if user_role != 'Admin' and str(doc['user_id']) != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not os.path.exists(doc['file_path']):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    return FileResponse(doc['file_path'], media_type='application/pdf', filename=doc['name'])

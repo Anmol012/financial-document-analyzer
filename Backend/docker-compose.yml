@@ -38,7 +38,7 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - FLASK_ENV=production
+      - APP_ENV=production
       - MONGODB_URI=mongodb://admin:admin123@mongodb:27017/financial_analyzer?authSource=admin
       - REDIS_URL=redis://redis:6379/0
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key-change-this}
@@ -64,7 +64,7 @@ services:
       dockerfile: Dockerfile
     container_name: financial_analyzer_celery_worker
     restart: always
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=4
+    command: celery -A celery_app worker --loglevel=info --concurrency=4
     environment:
       - MONGODB_URI=mongodb://admin:admin123@mongodb:27017/financial_analyzer?authSource=admin
       - REDIS_URL=redis://redis:6379/0
@@ -90,7 +90,7 @@ services:
       dockerfile: Dockerfile
     container_name: financial_analyzer_celery_beat
     restart: always
-    command: celery -A app.celery_app beat --loglevel=info
+    command: celery -A celery_app beat --loglevel=info
     environment:
       - MONGODB_URI=mongodb://admin:admin123@mongodb:27017/financial_analyzer?authSource=admin
       - REDIS_URL=redis://redis:6379/0

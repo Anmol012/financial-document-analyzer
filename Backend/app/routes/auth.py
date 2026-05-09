@@ -1,131 +1,165 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from app.extensions import mongo
-from app.models import User
+from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
 from bson import ObjectId
+import bcrypt
+import uuid
 import logging
 
-bp = Blueprint('auth', __name__)
+from config import Config
+from app.extensions import mongo, redis_client, limiter
+from app.dependencies import get_current_user, ALGORITHM
+
+router = APIRouter()
 logger = logging.getLogger(__name__)
 
-@bp.route('/register', methods=['POST'])
-def register():
-    try:
-        data = request.get_json()
-        
-        # Validate input
-        if not data or not all(k in data for k in ('username', 'email', 'password')):
-            return jsonify({'error': 'Missing required fields'}), 400
-        
-        username = data['username']
-        email = data['email']
-        password = data['password']
-        role = data.get('role', 'Viewer')
-        
-        # Validate role
-        if role not in ['Admin', 'Viewer']:
-            return jsonify({'error': 'Invalid role'}), 400
-        
-        # Check if user exists
-        existing_user = mongo.db.users.find_one({'email': email})
-        if existing_user:
-            return jsonify({'error': 'Email already exists'}), 400
-        
-        # Create user
-        user_data = User.create(username, email, password, role)
-        result = mongo.db.users.insert_one(user_data)
-        
-        logger.info(f"New user registered: {email}")
-        
-        return jsonify({
-            'message': 'User registered successfully',
-            'user': {
-                'id': str(result.inserted_id),
-                'username': username,
-                'email': email,
-                'role': role
-            }
-        }), 201
-        
-    except Exception as e:
-        logger.error(f"Registration error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
-@bp.route('/login', methods=['POST'])
-def login():
-    try:
-        data = request.get_json()
-        
-        # Validate input
-        if not data or not all(k in data for k in ('email', 'password')):
-            return jsonify({'error': 'Missing required fields'}), 400
-        
-        email = data['email']
-        password = data['password']
-        
-        # Find user
-        user = mongo.db.users.find_one({'email': email})
-        if not user:
-            return jsonify({'error': 'Invalid credentials'}), 401
-        
-        # Verify password
-        if not User.verify_password(user['password'], password):
-            return jsonify({'error': 'Invalid credentials'}), 401
-        
-        # Create access token
-        access_token = create_access_token(
-            identity=str(user['_id']),
-            additional_claims={'role': user['role']}
-        )
-        
-        logger.info(f"User logged in: {email}")
-        
-        return jsonify({
-            'message': 'Login successful',
-            'token': access_token,
-            'user': {
-                'id': str(user['_id']),
-                'username': user['username'],
-                'role': user['role']
-            }
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Login error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
 
-@bp.route('/logout', methods=['POST'])
-@jwt_required()
-def logout():
-    try:
-        user_id = get_jwt_identity()
-        logger.info(f"User logged out: {user_id}")
-        
-        return jsonify({'message': 'Logout successful'}), 200
-        
-    except Exception as e:
-        logger.error(f"Logout error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+# ─── Pydantic schemas ────────────────────────────────────────────────────────
 
-@bp.route('/me', methods=['GET'])
-@jwt_required()
-def get_current_user():
+class RegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+# ─── Token helpers ───────────────────────────────────────────────────────────
+
+def _make_token(user_id: str, role: str, expires: timedelta, token_type: str) -> tuple[str, str, int]:
+    jti = str(uuid.uuid4())
+    exp = datetime.utcnow() + expires
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "jti": jti,
+        "type": token_type,
+        "exp": exp,
+    }
+    token = jwt.encode(payload, Config.JWT_SECRET_KEY, algorithm=ALGORITHM)
+    return token, jti, int(exp.timestamp())
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
+@router.post("/register", status_code=201)
+@limiter.limit("5/minute")
+async def register(request: Request, data: RegisterRequest):
+    username = data.username.strip()
+    email = data.email.strip().lower()
+    password = data.password
+
+    if len(username) < 3 or len(username) > 50:
+        raise HTTPException(status_code=400, detail="Username must be 3-50 characters")
+    if '@' not in email or '.' not in email.split('@')[-1]:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    if mongo.db.users.find_one({'email': email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+    user_doc = {
+        'username': username,
+        'email': email,
+        'password': hashed,
+        'role': 'Viewer',
+        'created_at': datetime.utcnow(),
+        'updated_at': datetime.utcnow(),
+    }
+    result = mongo.db.users.insert_one(user_doc)
+    logger.info(f"New user registered: {email}")
+
+    return {
+        'message': 'User registered successfully',
+        'user': {
+            'id': str(result.inserted_id),
+            'username': username,
+            'email': email,
+            'role': 'Viewer',
+        },
+    }
+
+
+@router.post("/login")
+@limiter.limit("10/minute")
+async def login(request: Request, data: LoginRequest):
+    email = data.email.strip().lower()
+
+    user = mongo.db.users.find_one({'email': email})
+    if not user or not bcrypt.checkpw(data.password.encode(), user['password']):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    access_token, _, _ = _make_token(
+        str(user['_id']), user['role'], Config.JWT_ACCESS_TOKEN_EXPIRES, "access"
+    )
+    refresh_token, _, _ = _make_token(
+        str(user['_id']), user['role'], Config.JWT_REFRESH_TOKEN_EXPIRES, "refresh"
+    )
+
+    logger.info(f"User logged in: {email}")
+    return {
+        'message': 'Login successful',
+        'token': access_token,
+        'refresh_token': refresh_token,
+        'user': {
+            'id': str(user['_id']),
+            'username': user['username'],
+            'email': user['email'],
+            'role': user['role'],
+        },
+    }
+
+
+@router.post("/logout")
+async def logout(current_user: dict = Depends(get_current_user)):
+    jti = current_user.get('jti')
+    exp = current_user.get('exp', 0)
+    ttl = int(exp - datetime.utcnow().timestamp())
+    if jti and ttl > 0:
+        try:
+            redis_client.client.setex(f'blocklist:{jti}', ttl, 'revoked')
+        except Exception:
+            pass
+    return {'message': 'Logout successful'}
+
+
+@router.post("/refresh")
+async def refresh(token: str = Depends(oauth2_scheme)):
     try:
-        user_id = get_jwt_identity()
+        payload = jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user_id = payload.get("sub")
         user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
-        
         if not user:
-            return jsonify({'error': 'User not found'}), 404
-        
-        return jsonify({
-            'user': {
-                'id': str(user['_id']),
-                'username': user['username'],
-                'email': user['email'],
-                'role': user['role']
-            }
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Get current user error: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
+            raise HTTPException(status_code=404, detail="User not found")
+        access_token, _, _ = _make_token(
+            user_id, user['role'], Config.JWT_ACCESS_TOKEN_EXPIRES, "access"
+        )
+        return {'token': access_token}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+
+@router.get("/me")
+async def get_current_user_profile(current_user: dict = Depends(get_current_user)):
+    user = mongo.db.users.find_one({'_id': ObjectId(current_user['sub'])})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        'user': {
+            'id': str(user['_id']),
+            'username': user['username'],
+            'email': user['email'],
+            'role': user['role'],
+        }
+    }

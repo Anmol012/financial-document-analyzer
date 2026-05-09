@@ -3,8 +3,8 @@ import { logout } from '../api';
 import { Link } from 'react-router-dom';
 
 const Header = ({ setIsAuthenticated }) => {
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    await logout();
     setIsAuthenticated(false);
   };
 

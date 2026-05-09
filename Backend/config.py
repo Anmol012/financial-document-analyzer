@@ -44,5 +44,6 @@ class Config:
     OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'mistral:7b')
     
     # Application Settings
+    APP_ENV = os.getenv('APP_ENV', 'development')
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
